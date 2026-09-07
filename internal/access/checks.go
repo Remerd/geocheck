@@ -2,6 +2,8 @@ package access
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"net/url"
 	"regexp"
 	"strings"
@@ -23,6 +25,7 @@ func Checks() []Check {
 		tiktok(),
 		gemini(),
 		notebookLM(),
+		lovable(),
 	}
 }
 
@@ -519,6 +522,63 @@ func notebookLM() Check {
 				return Result{State: StateError, Detail: "request failed", Err: err}
 			}
 			return classifyNotebookLM(resp.Status, resp.FinalURL, resp.Text())
+		},
+	}
+}
+
+// classifyLovable interprets the unauthenticated realtime handshake. Lovable's
+// editor reaches this endpoint before opening a session: a 401 means the edge
+// accepted the caller and is asking for credentials, while a bare 403 is the
+// IP refusal this probe is looking for.
+func classifyLovable(status int, body string) Result {
+	detail := "HTTP " + itoa(status)
+	if isChallenge(status, strings.ToLower(body)) {
+		return Result{
+			State:  StateError,
+			Detail: detail + "; Cloudflare challenged the request, so availability was never tested",
+		}
+	}
+	switch status {
+	case 401:
+		return Result{State: StateAvailable, Detail: detail + "; authentication required"}
+	case 403:
+		return Result{State: StateBlocked, Detail: detail + "; realtime access refused"}
+	default:
+		return Result{State: StateError, Detail: detail + "; unexpected response"}
+	}
+}
+
+func lovable() Check {
+	return lovableAt("https://api.lovable.dev/realtime")
+}
+
+// lovableAt exists so tests can inspect the handshake with a local server.
+func lovableAt(endpoint string) Check {
+	return Check{
+		ID: "lovable_access", Name: "Lovable",
+		Run: func(ctx context.Context, env Env) Result {
+			keyBytes := make([]byte, 16)
+			if _, err := rand.Read(keyBytes); err != nil {
+				return Result{State: StateError, Detail: "could not generate WebSocket key", Err: err}
+			}
+
+			resp, err := env.Stack.Do(ctx, env.Family, netx.Request{
+				URL:        endpoint,
+				UserAgent:  browserUA,
+				NoRedirect: true,
+				Headers: map[string]string{
+					"Connection":             "Upgrade",
+					"Upgrade":                "websocket",
+					"Origin":                 "https://lovable.dev",
+					"Sec-WebSocket-Key":      base64.StdEncoding.EncodeToString(keyBytes),
+					"Sec-WebSocket-Protocol": "bearer, invalid",
+					"Sec-WebSocket-Version":  "13",
+				},
+			})
+			if err != nil {
+				return Result{State: StateError, Detail: "request failed", Err: err}
+			}
+			return classifyLovable(resp.Status, resp.Text())
 		},
 	}
 }
